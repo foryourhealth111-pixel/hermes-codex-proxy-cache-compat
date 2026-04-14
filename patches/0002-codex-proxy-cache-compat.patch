@@ -1,0 +1,631 @@
+diff --git a/hermes_state.py b/hermes_state.py
+index 5e563666..d0172c14 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -31,7 +31,7 @@ T = TypeVar("T")
+ 
+ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+ 
+-SCHEMA_VERSION = 6
++SCHEMA_VERSION = 7
+ 
+ SCHEMA_SQL = """
+ CREATE TABLE IF NOT EXISTS schema_version (
+@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS sessions (
+     model TEXT,
+     model_config TEXT,
+     system_prompt TEXT,
++    prompt_cache_key TEXT,
++    prompt_cache_supported INTEGER,
+     parent_session_id TEXT,
+     started_at REAL NOT NULL,
+     ended_at REAL,
+@@ -329,6 +331,19 @@ class SessionDB:
+                     except sqlite3.OperationalError:
+                         pass  # Column already exists
+                 cursor.execute("UPDATE schema_version SET version = 6")
++            if current_version < 7:
++                for name, column_type in [
++                    ("prompt_cache_key", "TEXT"),
++                    ("prompt_cache_supported", "INTEGER"),
++                ]:
++                    try:
++                        safe_name = name.replace('"', '""')
++                        cursor.execute(
++                            f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}'
++                        )
++                    except sqlite3.OperationalError:
++                        pass
++                cursor.execute("UPDATE schema_version SET version = 7")
+ 
+         # Unique title index — always ensure it exists (safe to run after migrations
+         # since the title column is guaranteed to exist at this point)
+@@ -409,6 +424,37 @@ class SessionDB:
+             )
+         self._execute_write(_do)
+ 
++    def update_prompt_cache_state(
++        self,
++        session_id: str,
++        *,
++        prompt_cache_key: Optional[str] = None,
++        prompt_cache_supported: Optional[bool] = None,
++    ) -> None:
++        """Persist Responses API prompt cache observations for a session."""
++        supported_value = None
++        if prompt_cache_supported is not None:
++            supported_value = 1 if prompt_cache_supported else 0
++
++        def _do(conn):
++            conn.execute(
++                """UPDATE sessions SET
++                   prompt_cache_key = COALESCE(?, prompt_cache_key),
++                   prompt_cache_supported = CASE
++                       WHEN ? IS NULL THEN prompt_cache_supported
++                       ELSE ?
++                   END
++                   WHERE id = ?""",
++                (
++                    prompt_cache_key,
++                    supported_value,
++                    supported_value,
++                    session_id,
++                ),
++            )
++
++        self._execute_write(_do)
++
+     def update_token_counts(
+         self,
+         session_id: str,
+diff --git a/run_agent.py b/run_agent.py
+index 5c946591..f32cc217 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -474,6 +474,10 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
+ # _apply_client_headers_for_base_url can share it.
+ # =========================================================================
+ _QWEN_CODE_VERSION = "0.14.1"
++_CODEX_TRANSPORT_USER_AGENT = (
++    "codex_exec/0.120.0 (Ubuntu 22.4.0; x86_64) "
++    "gnome-terminal (codex_exec; 0.120.0)"
++)
+ 
+ 
+ def _qwen_portal_headers() -> dict:
+@@ -489,6 +493,37 @@ def _qwen_portal_headers() -> dict:
+     }
+ 
+ 
++def _codex_transport_headers(session_token: str, turn_id: str) -> dict:
++    """Return Codex-compatible transport headers for custom /codex proxies.
++
++    Some Codex-flavoured gateways, including the user's right.codes route,
++    key prompt-cache behavior off request transport metadata in addition to
++    the JSON body.  These headers intentionally mirror the minimal subset
++    required to unlock prompt-cache compatibility on those gateways.
++    """
++    session_token = str(session_token or "").strip()
++    turn_id = str(turn_id or "").strip()
++    if not session_token:
++        return {
++            "User-Agent": _CODEX_TRANSPORT_USER_AGENT,
++            "originator": "codex_exec",
++        }
++
++    metadata = {
++        "session_id": session_token,
++        "turn_id": turn_id or f"{session_token}_turn",
++        "sandbox": "none",
++    }
++    return {
++        "User-Agent": _CODEX_TRANSPORT_USER_AGENT,
++        "originator": "codex_exec",
++        "session_id": session_token,
++        "x-client-request-id": session_token,
++        "x-codex-window-id": f"{session_token}:0",
++        "x-codex-turn-metadata": json.dumps(metadata, ensure_ascii=False),
++    }
++
++
+ class AIAgent:
+     """
+     AI Agent with tool calling capabilities.
+@@ -1038,6 +1073,9 @@ class AIAgent:
+         
+         # Cached system prompt -- built once per session, only rebuilt on compression
+         self._cached_system_prompt: Optional[str] = None
++        self._responses_prompt_cache_key: Optional[str] = None
++        self._responses_prompt_cache_supported: Optional[bool] = None
++        self._responses_prompt_cache_warning_logged = False
+         
+         # Filesystem checkpoint manager (transparent — not a tool)
+         from tools.checkpoint_manager import CheckpointManager
+@@ -1074,7 +1112,13 @@ class AIAgent:
+                 logger.warning(
+                     "Session DB create_session failed (session_search still available): %s", e
+                 )
+-        
++            try:
++                session_row = self._session_db.get_session(self.session_id)
++                if session_row:
++                    self._hydrate_responses_prompt_cache_state(session_row)
++            except Exception:
++                pass
++
+         # In-memory todo list for task planning (one per agent/session)
+         from tools.todo_tool import TodoStore
+         self._todo_store = TodoStore()
+@@ -1506,6 +1550,7 @@ class AIAgent:
+         self.api_mode = api_mode
+         if api_key:
+             self.api_key = api_key
++        self._reset_responses_prompt_cache_state()
+ 
+         # ── Build new client ──
+         if api_mode == "anthropic_messages":
+@@ -3054,6 +3099,157 @@ class AIAgent:
+ 
+ 
+ 
++    def _build_runtime_user_context(self) -> str:
++        """Build ephemeral runtime metadata for the current turn.
++
++        This is injected into the current user message at API-call time only,
++        never persisted to the session DB or frozen into the cached system
++        prompt. Keeping it out of the system prompt preserves a stable cache
++        prefix across fresh sessions while still exposing time/model/session
++        metadata to the model.
++        """
++        context_lines = []
++
++        try:
++            from hermes_time import now as _hermes_now
++            _now = _hermes_now()
++            context_lines.append(
++                f"Current date & time: {_now.strftime('%A, %B %d, %Y %I:%M %p')}"
++            )
++        except Exception:
++            pass
++
++        if self.pass_session_id and self.session_id:
++            context_lines.append(f"Session ID: {self.session_id}")
++        if self.model:
++            context_lines.append(f"Model: {self.model}")
++        if self.provider:
++            context_lines.append(f"Provider: {self.provider}")
++
++        if not context_lines:
++            return ""
++
++        return (
++            "<runtime-context>\n"
++            "[System note: The following is Hermes runtime metadata, "
++            "NOT new user input. Use it as execution context only.]\n\n"
++            + "\n".join(context_lines)
++            + "\n"
++            "</runtime-context>"
++        )
++
++    @staticmethod
++    def _normalize_prompt_cache_key(value: Any) -> Optional[str]:
++        if value is None:
++            return None
++        text = str(value).strip()
++        return text or None
++
++    def _reset_responses_prompt_cache_state(self) -> None:
++        self._responses_prompt_cache_key = None
++        self._responses_prompt_cache_supported = None
++        self._responses_prompt_cache_warning_logged = False
++
++    def _hydrate_responses_prompt_cache_state(
++        self,
++        session_row: Optional[Dict[str, Any]],
++    ) -> None:
++        if not isinstance(session_row, dict):
++            return
++
++        stored_key = self._normalize_prompt_cache_key(session_row.get("prompt_cache_key"))
++        if stored_key:
++            self._responses_prompt_cache_key = stored_key
++
++        raw_supported = session_row.get("prompt_cache_supported")
++        if raw_supported in (0, 1, False, True):
++            self._responses_prompt_cache_supported = bool(raw_supported)
++            if self._responses_prompt_cache_supported is False:
++                self._responses_prompt_cache_warning_logged = True
++
++    def _select_responses_prompt_cache_key(self) -> Optional[str]:
++        if self._responses_prompt_cache_supported is False:
++            return None
++        return self._responses_prompt_cache_key or self.session_id
++
++    def _uses_codex_transport_compat_headers(self, base_url: Optional[str] = None) -> bool:
++        """Return True for custom Codex-style Responses gateways that expect
++        Codex transport metadata headers in addition to the JSON payload.
++        """
++        if self.api_mode != "codex_responses":
++            return False
++
++        normalized = (base_url or self.base_url or "").strip().lower()
++        if not normalized or "/codex" not in normalized:
++            return False
++        if "chatgpt.com/backend-api/codex" in normalized:
++            return False
++        if "api.githubcopilot.com" in normalized or "models.github.ai" in normalized:
++            return False
++        if "api.openai.com" in normalized:
++            return False
++        return True
++
++    def _responses_transport_headers(self, session_token: Optional[str]) -> Dict[str, str]:
++        turn_id = f"{self.session_id or 'hermes'}_turn_{uuid.uuid4().hex[:12]}"
++        return _codex_transport_headers(session_token or "", turn_id)
++
++    def _persist_responses_prompt_cache_state(self) -> None:
++        if not self._session_db or not self.session_id:
++            return
++        try:
++            self._session_db.update_prompt_cache_state(
++                self.session_id,
++                prompt_cache_key=self._responses_prompt_cache_key,
++                prompt_cache_supported=self._responses_prompt_cache_supported,
++            )
++        except Exception:
++            pass
++
++    def _record_responses_prompt_cache_behavior(
++        self,
++        requested_key: Any,
++        response: Any,
++    ) -> None:
++        if self.api_mode != "codex_responses":
++            return
++
++        requested_key = self._normalize_prompt_cache_key(requested_key)
++        returned_key = self._normalize_prompt_cache_key(
++            getattr(response, "prompt_cache_key", None)
++        )
++        previous_key = self._responses_prompt_cache_key
++        previous_support = self._responses_prompt_cache_supported
++
++        if returned_key and requested_key and returned_key == requested_key:
++            self._responses_prompt_cache_key = returned_key
++            self._responses_prompt_cache_supported = True
++        elif returned_key and requested_key:
++            if previous_key and requested_key == previous_key:
++                self._responses_prompt_cache_supported = False
++            else:
++                self._responses_prompt_cache_key = returned_key
++        elif returned_key:
++            self._responses_prompt_cache_key = returned_key
++
++        if (
++            self._responses_prompt_cache_supported is False
++            and not self._responses_prompt_cache_warning_logged
++        ):
++            self._responses_prompt_cache_warning_logged = True
++            logger.warning(
++                "Responses endpoint rewrote prompt_cache_key for session %s; "
++                "Hermes will stop sending client cache keys for %s",
++                self.session_id or "unknown",
++                self.base_url or "this endpoint",
++            )
++
++        if (
++            self._responses_prompt_cache_key != previous_key
++            or self._responses_prompt_cache_supported != previous_support
++        ):
++            self._persist_responses_prompt_cache_state()
++
+     def _build_system_prompt(self, system_message: str = None) -> str:
+         """
+         Assemble the full system prompt from all layers.
+@@ -3068,8 +3264,12 @@ class AIAgent:
+         #   3. Persistent memory (frozen snapshot)
+         #   4. Skills guidance (if skills tools are loaded)
+         #   5. Context files (AGENTS.md, .cursorrules — SOUL.md excluded here when used as identity)
+-        #   6. Current date & time (frozen at build time)
+-        #   7. Platform-specific formatting hint
++        #   6. Platform-specific formatting hint
++        #
++        # Runtime metadata (current time, session ID, model/provider) is kept
++        # OUT of the cached system prompt and injected into the current user
++        # message at API-call time instead. This keeps the cached prefix stable
++        # across fresh sessions for better prompt-cache reuse.
+ 
+         # Try SOUL.md as primary identity (unless context files are skipped)
+         _soul_loaded = False
+@@ -3186,17 +3386,6 @@ class AIAgent:
+             if context_files_prompt:
+                 prompt_parts.append(context_files_prompt)
+ 
+-        from hermes_time import now as _hermes_now
+-        now = _hermes_now()
+-        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+-        if self.pass_session_id and self.session_id:
+-            timestamp_line += f"\nSession ID: {self.session_id}"
+-        if self.model:
+-            timestamp_line += f"\nModel: {self.model}"
+-        if self.provider:
+-            timestamp_line += f"\nProvider: {self.provider}"
+-        prompt_parts.append(timestamp_line)
+-
+         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
+         # of the requested model. Inject explicit model identity into the system prompt
+         # so the agent can correctly report which model it is (workaround for API bug).
+@@ -3742,6 +3931,7 @@ class AIAgent:
+             "model", "instructions", "input", "tools", "store",
+             "reasoning", "include", "max_output_tokens", "temperature",
+             "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
++            "extra_headers",
+         }
+         normalized: Dict[str, Any] = {
+             "model": model,
+@@ -3777,6 +3967,16 @@ class AIAgent:
+             if val is not None:
+                 normalized[passthrough_key] = val
+ 
++        extra_headers = api_kwargs.get("extra_headers")
++        if isinstance(extra_headers, dict):
++            normalized_headers: Dict[str, str] = {}
++            for key, value in extra_headers.items():
++                if value is None:
++                    continue
++                normalized_headers[str(key)] = str(value)
++            if normalized_headers:
++                normalized["extra_headers"] = normalized_headers
++
+         if allow_stream:
+             stream = api_kwargs.get("stream")
+             if stream is not None and stream is not True:
+@@ -4569,6 +4769,11 @@ class AIAgent:
+         normalized = (base_url or "").lower()
+         if "openrouter" in normalized:
+             self._client_kwargs["default_headers"] = dict(_OR_HEADERS)
++        elif self._uses_codex_transport_compat_headers(base_url):
++            self._client_kwargs["default_headers"] = {
++                "User-Agent": _CODEX_TRANSPORT_USER_AGENT,
++                "originator": "codex_exec",
++            }
+         elif "api.githubcopilot.com" in normalized:
+             from hermes_cli.models import copilot_default_headers
+ 
+@@ -6004,7 +6209,13 @@ class AIAgent:
+             }
+ 
+             if not is_github_responses:
+-                kwargs["prompt_cache_key"] = self.session_id
++                prompt_cache_key = self._select_responses_prompt_cache_key()
++                if prompt_cache_key:
++                    kwargs["prompt_cache_key"] = prompt_cache_key
++                    if self._uses_codex_transport_compat_headers():
++                        kwargs["extra_headers"] = self._responses_transport_headers(
++                            prompt_cache_key
++                        )
+ 
+             if reasoning_enabled:
+                 if is_github_responses:
+@@ -6640,6 +6851,7 @@ class AIAgent:
+                 self._session_db.end_session(self.session_id, "compression")
+                 old_session_id = self.session_id
+                 self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
++                self._reset_responses_prompt_cache_state()
+                 # Update session_log_file to point to the new session's JSON file
+                 self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
+                 self._session_db.create_session(
+@@ -7711,6 +7923,7 @@ class AIAgent:
+                 try:
+                     session_row = self._session_db.get_session(self.session_id)
+                     if session_row:
++                        self._hydrate_responses_prompt_cache_state(session_row)
+                         stored_prompt = session_row.get("system_prompt") or None
+                 except Exception:
+                     pass  # Fall through to build fresh
+@@ -7840,6 +8053,8 @@ class AIAgent:
+         except Exception as exc:
+             logger.warning("pre_llm_call hook failed: %s", exc)
+ 
++        _runtime_user_context = self._build_runtime_user_context()
++
+         # Main conversation loop
+         api_call_count = 0
+         final_response = None
+@@ -7948,6 +8163,8 @@ class AIAgent:
+                 # never mutated, so nothing leaks into session persistence.
+                 if idx == current_turn_user_idx and msg.get("role") == "user":
+                     _injections = []
++                    if _runtime_user_context:
++                        _injections.append(_runtime_user_context)
+                     if _ext_prefetch_cache:
+                         _fenced = build_memory_context_block(_ext_prefetch_cache)
+                         if _fenced:
+@@ -8367,6 +8584,12 @@ class AIAgent:
+                             time.sleep(0.2)
+                         continue  # Retry the API call
+ 
++                    if self.api_mode == "codex_responses":
++                        self._record_responses_prompt_cache_behavior(
++                            api_kwargs.get("prompt_cache_key") if isinstance(api_kwargs, dict) else None,
++                            response,
++                        )
++
+                     # Check finish_reason before proceeding
+                     if self.api_mode == "codex_responses":
+                         status = getattr(response, "status", None)
+diff --git a/tests/run_agent/test_run_agent_codex_responses.py b/tests/run_agent/test_run_agent_codex_responses.py
+index 533a85ac..7c188d33 100644
+--- a/tests/run_agent/test_run_agent_codex_responses.py
++++ b/tests/run_agent/test_run_agent_codex_responses.py
+@@ -70,6 +70,27 @@ def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
+     return agent
+ 
+ 
++def _build_custom_codex_proxy_agent(monkeypatch):
++    _patch_agent_bootstrap(monkeypatch)
++
++    agent = run_agent.AIAgent(
++        model="gpt-5.4-xhigh",
++        provider="custom",
++        api_mode="codex_responses",
++        base_url="https://right.codes/codex/v1",
++        api_key="custom-token",
++        quiet_mode=True,
++        max_iterations=4,
++        skip_context_files=True,
++        skip_memory=True,
++    )
++    agent._cleanup_task_resources = lambda task_id: None
++    agent._persist_session = lambda messages, history=None: None
++    agent._save_trajectory = lambda messages, user_message, completed: None
++    agent._save_session_log = lambda messages: None
++    return agent
++
++
+ def _codex_message_response(text: str):
+     return SimpleNamespace(
+         output=[
+@@ -271,6 +292,80 @@ def test_build_api_kwargs_codex(monkeypatch):
+     assert "extra_body" not in kwargs
+ 
+ 
++def test_build_api_kwargs_reuses_server_returned_prompt_cache_key(monkeypatch):
++    agent = _build_agent(monkeypatch)
++
++    agent._record_responses_prompt_cache_behavior(
++        agent.session_id,
++        SimpleNamespace(prompt_cache_key="server-issued-key"),
++    )
++
++    kwargs = agent._build_api_kwargs(
++        [
++            {"role": "system", "content": "You are Hermes."},
++            {"role": "user", "content": "Ping"},
++        ]
++    )
++
++    assert kwargs["prompt_cache_key"] == "server-issued-key"
++
++
++def test_second_prompt_cache_key_rewrite_disables_future_client_key(monkeypatch):
++    agent = _build_agent(monkeypatch)
++
++    agent._record_responses_prompt_cache_behavior(
++        agent.session_id,
++        SimpleNamespace(prompt_cache_key="server-issued-key-1"),
++    )
++    agent._record_responses_prompt_cache_behavior(
++        "server-issued-key-1",
++        SimpleNamespace(prompt_cache_key="server-issued-key-2"),
++    )
++
++    kwargs = agent._build_api_kwargs(
++        [
++            {"role": "system", "content": "You are Hermes."},
++            {"role": "user", "content": "Ping"},
++        ]
++    )
++
++    assert agent._responses_prompt_cache_supported is False
++    assert "prompt_cache_key" not in kwargs
++
++
++def test_build_api_kwargs_custom_codex_proxy_injects_transport_headers(monkeypatch):
++    agent = _build_custom_codex_proxy_agent(monkeypatch)
++    kwargs = agent._build_api_kwargs(
++        [
++            {"role": "system", "content": "You are Hermes."},
++            {"role": "user", "content": "Ping"},
++        ]
++    )
++
++    assert kwargs["prompt_cache_key"] == agent.session_id
++    assert kwargs["extra_headers"]["session_id"] == agent.session_id
++    assert kwargs["extra_headers"]["x-client-request-id"] == agent.session_id
++    assert kwargs["extra_headers"]["x-codex-window-id"] == f"{agent.session_id}:0"
++    assert kwargs["extra_headers"]["originator"] == "codex_exec"
++    assert "codex_exec/0.120.0" in kwargs["extra_headers"]["User-Agent"]
++    assert agent.session_id in kwargs["extra_headers"]["x-codex-turn-metadata"]
++
++
++def test_preflight_codex_api_kwargs_preserves_extra_headers(monkeypatch):
++    agent = _build_custom_codex_proxy_agent(monkeypatch)
++    kwargs = agent._build_api_kwargs(
++        [
++            {"role": "system", "content": "You are Hermes."},
++            {"role": "user", "content": "Ping"},
++        ]
++    )
++
++    normalized = agent._preflight_codex_api_kwargs(kwargs)
++
++    assert normalized["extra_headers"]["session_id"] == agent.session_id
++    assert normalized["extra_headers"]["originator"] == "codex_exec"
++
++
+ def test_build_api_kwargs_copilot_responses_omits_openai_only_fields(monkeypatch):
+     agent = _build_copilot_agent(monkeypatch)
+     kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+diff --git a/tests/test_hermes_state.py b/tests/test_hermes_state.py
+index 5f9a16a5..97947895 100644
+--- a/tests/test_hermes_state.py
++++ b/tests/test_hermes_state.py
+@@ -53,6 +53,18 @@ class TestSessionLifecycle:
+         session = db.get_session("s1")
+         assert session["system_prompt"] == "You are a helpful assistant."
+ 
++    def test_update_prompt_cache_state(self, db):
++        db.create_session(session_id="s1", source="cli")
++        db.update_prompt_cache_state(
++            "s1",
++            prompt_cache_key="server-issued-key",
++            prompt_cache_supported=False,
++        )
++
++        session = db.get_session("s1")
++        assert session["prompt_cache_key"] == "server-issued-key"
++        assert session["prompt_cache_supported"] == 0
++
+     def test_update_token_counts(self, db):
+         db.create_session(session_id="s1", source="cli")
+         db.update_token_counts("s1", input_tokens=200, output_tokens=100)
+@@ -935,13 +947,15 @@ class TestSchemaInit:
+     def test_schema_version(self, db):
+         cursor = db._conn.execute("SELECT version FROM schema_version")
+         version = cursor.fetchone()[0]
+-        assert version == 6
++        assert version == 7
+ 
+     def test_title_column_exists(self, db):
+         """Verify the title column was created in the sessions table."""
+         cursor = db._conn.execute("PRAGMA table_info(sessions)")
+         columns = {row[1] for row in cursor.fetchall()}
+         assert "title" in columns
++        assert "prompt_cache_key" in columns
++        assert "prompt_cache_supported" in columns
+ 
+     def test_migration_from_v2(self, tmp_path):
+         """Simulate a v2 database and verify migration adds title column."""
+@@ -991,17 +1005,19 @@ class TestSchemaInit:
+         conn.commit()
+         conn.close()
+ 
+-        # Open with SessionDB — should migrate to v6
++        # Open with SessionDB — should migrate to v7
+         migrated_db = SessionDB(db_path=db_path)
+ 
+         # Verify migration
+         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
+-        assert cursor.fetchone()[0] == 6
++        assert cursor.fetchone()[0] == 7
+ 
+         # Verify title column exists and is NULL for existing sessions
+         session = migrated_db.get_session("existing")
+         assert session is not None
+         assert session["title"] is None
++        assert session["prompt_cache_key"] is None
++        assert session["prompt_cache_supported"] is None
+ 
+         # Verify we can set title on migrated session
+         assert migrated_db.set_session_title("existing", "Migrated Title") is True

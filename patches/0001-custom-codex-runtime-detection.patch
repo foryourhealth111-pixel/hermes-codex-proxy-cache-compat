@@ -1,0 +1,177 @@
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index cd0b6672..577c237c 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -34,18 +34,53 @@ def _normalize_custom_provider_name(value: str) -> str:
+     return value.strip().lower().replace(" ", "-")
+ 
+ 
+-def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
++def _model_prefers_responses_api(model_name: str) -> bool:
++    normalized = (model_name or "").strip().lower()
++    if not normalized:
++        return False
++    return normalized.startswith("gpt-5") or "codex" in normalized
++
++
++def _detect_api_mode_for_url(base_url: str, *, model_name: str = "") -> Optional[str]:
+     """Auto-detect api_mode from the resolved base URL.
+ 
+     Direct api.openai.com endpoints need the Responses API for GPT-5.x
+     tool calls with reasoning (chat/completions returns 400).
++
++    Some custom OpenAI-compatible gateways expose a Codex/Responses-style
++    path (for example ``.../codex/v1``) without using the api.openai.com
++    hostname. Treat those as Responses endpoints when the selected model is
++    GPT-5/Codex-family.
+     """
+     normalized = (base_url or "").strip().lower().rstrip("/")
+     if "api.openai.com" in normalized and "openrouter" not in normalized:
+         return "codex_responses"
++    if _model_prefers_responses_api(model_name) and "/codex" in normalized:
++        return "codex_responses"
+     return None
+ 
+ 
++def _resolve_api_mode(
++    *,
++    base_url: str,
++    model_name: str = "",
++    configured_mode: Optional[str] = None,
++    default: str = "chat_completions",
++) -> str:
++    """Resolve the effective api_mode for a runtime endpoint.
++
++    Preserve explicit non-chat modes, but upgrade stale ``chat_completions``
++    to ``codex_responses`` when the URL/model combination clearly points to a
++    Responses-compatible Codex endpoint.
++    """
++    detected_mode = _detect_api_mode_for_url(base_url, model_name=model_name)
++    if configured_mode == "chat_completions" and detected_mode == "codex_responses":
++        return detected_mode
++    if configured_mode:
++        return configured_mode
++    return detected_mode or default
++
++
+ def _auto_detect_local_model(base_url: str) -> str:
+     """Query a local server for its model name when only one model is loaded."""
+     if not base_url:
+@@ -229,6 +264,7 @@ def _try_resolve_from_custom_pool(
+     base_url: str,
+     provider_label: str,
+     api_mode_override: Optional[str] = None,
++    model_name: str = "",
+ ) -> Optional[Dict[str, Any]]:
+     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
+     pool_key = get_custom_provider_pool_key(base_url)
+@@ -246,7 +282,11 @@ def _try_resolve_from_custom_pool(
+             return None
+         return {
+             "provider": provider_label,
+-            "api_mode": api_mode_override or _detect_api_mode_for_url(base_url) or "chat_completions",
++            "api_mode": _resolve_api_mode(
++                base_url=base_url,
++                model_name=model_name,
++                configured_mode=api_mode_override,
++            ),
+             "base_url": base_url,
+             "api_key": pool_api_key,
+             "source": f"pool:{pool_key}",
+@@ -329,8 +369,16 @@ def _resolve_named_custom_runtime(
+     if not base_url:
+         return None
+ 
++    model_cfg = _get_model_config()
++    model_name = str(custom_provider.get("model") or model_cfg.get("default") or "")
++
+     # Check if a credential pool exists for this custom endpoint
+-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"))
++    pool_result = _try_resolve_from_custom_pool(
++        base_url,
++        "custom",
++        custom_provider.get("api_mode"),
++        model_name,
++    )
+     if pool_result:
+         # Propagate the model name even when using pooled credentials —
+         # the pool doesn't know about the custom_providers model field.
+@@ -349,9 +397,11 @@ def _resolve_named_custom_runtime(
+ 
+     result = {
+         "provider": "custom",
+-        "api_mode": custom_provider.get("api_mode")
+-        or _detect_api_mode_for_url(base_url)
+-        or "chat_completions",
++        "api_mode": _resolve_api_mode(
++            base_url=base_url,
++            model_name=model_name,
++            configured_mode=custom_provider.get("api_mode"),
++        ),
+         "base_url": base_url,
+         "api_key": api_key or "no-key-required",
+         "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
+@@ -441,7 +491,10 @@ def _resolve_openrouter_runtime(
+     # For custom endpoints, check if a credential pool exists
+     if effective_provider == "custom" and base_url:
+         pool_result = _try_resolve_from_custom_pool(
+-            base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
++            base_url,
++            effective_provider,
++            _parse_api_mode(model_cfg.get("api_mode")),
++            str(model_cfg.get("default") or ""),
+         )
+         if pool_result:
+             return pool_result
+@@ -451,9 +504,11 @@ def _resolve_openrouter_runtime(
+ 
+     return {
+         "provider": effective_provider,
+-        "api_mode": _parse_api_mode(model_cfg.get("api_mode"))
+-        or _detect_api_mode_for_url(base_url)
+-        or "chat_completions",
++        "api_mode": _resolve_api_mode(
++            base_url=base_url,
++            model_name=str(model_cfg.get("default") or ""),
++            configured_mode=_parse_api_mode(model_cfg.get("api_mode")),
++        ),
+         "base_url": base_url,
+         "api_key": api_key,
+         "source": source,
+diff --git a/tests/hermes_cli/test_runtime_provider_resolution.py b/tests/hermes_cli/test_runtime_provider_resolution.py
+index 20486a80..406710b3 100644
+--- a/tests/hermes_cli/test_runtime_provider_resolution.py
++++ b/tests/hermes_cli/test_runtime_provider_resolution.py
+@@ -719,6 +719,32 @@ def test_model_config_api_mode(monkeypatch):
+     assert resolved["base_url"] == "http://127.0.0.1:9208/v1"
+ 
+ 
++def test_custom_codex_url_for_gpt5_overrides_stale_chat_completions(monkeypatch):
++    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
++    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
++    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
++    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
++    monkeypatch.setattr(
++        rp,
++        "load_config",
++        lambda: {
++            "model": {
++                "provider": "custom",
++                "default": "gpt-5.4-xhigh",
++                "base_url": "https://right.codes/codex/v1",
++                "api_key": "test-key-123",
++                "api_mode": "chat_completions",
++            }
++        },
++    )
++
++    resolved = rp.resolve_runtime_provider(requested="custom")
++
++    assert resolved["provider"] == "custom"
++    assert resolved["api_mode"] == "codex_responses"
++    assert resolved["base_url"] == "https://right.codes/codex/v1"
++
++
+ def test_model_config_api_mode_ignored_when_provider_differs(monkeypatch):
+     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "zai")
+     monkeypatch.setattr(

@@ -1,0 +1,28 @@
+diff --git a/agent/skill_utils.py b/agent/skill_utils.py
+index 97ba92b7..076e823c 100644
+--- a/agent/skill_utils.py
++++ b/agent/skill_utils.py
+@@ -210,12 +210,21 @@ def get_external_skills_dirs() -> List[Path]:
+             continue
+         # Expand ~ and environment variables
+         expanded = os.path.expanduser(os.path.expandvars(entry))
+-        p = Path(expanded).resolve()
++        try:
++            p = Path(expanded).resolve()
++        except OSError:
++            logger.debug("External skills dir could not be resolved, skipping: %s", expanded)
++            continue
+         if p == local_skills:
+             continue
+         if p in seen:
+             continue
+-        if p.is_dir():
++        try:
++            is_dir = p.is_dir()
++        except OSError:
++            logger.debug("External skills dir is inaccessible, skipping: %s", p)
++            continue
++        if is_dir:
+             seen.add(p)
+             result.append(p)
+         else:
