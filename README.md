@@ -1,5 +1,7 @@
 # Hermes Codex Proxy Cache Compat
 
+语言 / Language: 简体中文 | [English](./README.en.md)
+
 面向 Hermes 的一个公开补丁包，用来修复它在部分自定义 `/codex` 风格 Responses 中转站上的缓存命中问题。
 
 这个项目的目标很直接：
