@@ -202,6 +202,19 @@ https://something.example.com/codex/v1
 
 - `docs/VERIFICATION.md`
 
+## 社区
+
+如果你也在用这个补丁，或者准备在自己的 Hermes / `/codex` 代理上做适配，欢迎到 Linux.do 交流：
+
+- 社区首页：`https://linux.do/`
+
+如果你准备发帖，比较有价值的内容通常包括：
+
+- 你的 endpoint / model 组合
+- 是否是稳定线程场景
+- `cached_tokens` 或 `cache_read_tokens` 的变化
+- 你对其他代理的魔改结果
+
 ## 不同中转站怎么自己魔改
 
 看这里：

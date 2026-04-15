@@ -202,6 +202,19 @@ See:
 
 - `docs/VERIFICATION.md`
 
+## Community
+
+If you are using this patch, or adapting it for your own Hermes or `/codex` proxy setup, you are welcome to discuss it on Linux.do:
+
+- Community homepage: `https://linux.do/`
+
+If you plan to post about your results, the most useful details usually include:
+
+- your endpoint and model combination
+- whether the test used a stable-thread workflow
+- how `cached_tokens` or `cache_read_tokens` changed
+- what you had to modify for other proxies
+
 ## How to adapt this for other proxies
 
 See:
