@@ -105,11 +105,24 @@ python3 -m pytest -q -o addopts='' tests/test_hermes_state.py
 bash /path/to/hermes-codex-proxy-cache-compat/scripts/install_skill.sh ~/.hermes
 ```
 
+如果你在 Hermes WebUI / 嵌入式运行环境里，`$HOME` 可能不是实际 Hermes home。脚本在没有显式参数时会优先使用 `$HERMES_HOME`：
+
+```bash
+HERMES_HOME=/path/to/active/hermes-home \
+  bash /path/to/hermes-codex-proxy-cache-compat/scripts/install_skill.sh
+```
+
 如果你有多个 profile，就分别跑一次：
 
 ```bash
 bash /path/to/hermes-codex-proxy-cache-compat/scripts/install_skill.sh ~/.hermes
 bash /path/to/hermes-codex-proxy-cache-compat/scripts/install_skill.sh ~/.hermes/profiles/feishu2
+```
+
+可选：先跑安装脚本自测，确认 `$HERMES_HOME` 默认值和 `skills.external_dirs` 去重逻辑正常：
+
+```bash
+bash /path/to/hermes-codex-proxy-cache-compat/scripts/verify_install_skill.sh
 ```
 
 ### 5. 重启 Hermes gateway

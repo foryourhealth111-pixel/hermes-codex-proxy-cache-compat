@@ -105,11 +105,24 @@ python3 -m pytest -q -o addopts='' tests/test_hermes_state.py
 bash /path/to/hermes-codex-proxy-cache-compat/scripts/install_skill.sh ~/.hermes
 ```
 
+In Hermes WebUI or other embedded runtimes, `$HOME` may not be the active Hermes home. When no explicit target is passed, the script prefers `$HERMES_HOME`:
+
+```bash
+HERMES_HOME=/path/to/active/hermes-home \
+  bash /path/to/hermes-codex-proxy-cache-compat/scripts/install_skill.sh
+```
+
 If you maintain multiple profiles, run it once per profile:
 
 ```bash
 bash /path/to/hermes-codex-proxy-cache-compat/scripts/install_skill.sh ~/.hermes
 bash /path/to/hermes-codex-proxy-cache-compat/scripts/install_skill.sh ~/.hermes/profiles/feishu2
+```
+
+Optional: run the installer self-check first to verify `$HERMES_HOME` defaulting and `skills.external_dirs` de-duplication:
+
+```bash
+bash /path/to/hermes-codex-proxy-cache-compat/scripts/verify_install_skill.sh
 ```
 
 ### 5. Restart Hermes gateway
