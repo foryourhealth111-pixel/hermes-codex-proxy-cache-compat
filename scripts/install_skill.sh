@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HERMES_HOME_PATH="${1:-$HOME/.hermes}"
+HERMES_HOME_PATH="${1:-${HERMES_HOME:-$HOME/.hermes}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR%/scripts}"
 SKILL_SOURCE_DIR="$REPO_ROOT/skills/codex-proxy-cache-compat"
@@ -14,6 +14,7 @@ rm -rf "$SKILL_DEST_DIR"
 cp -R "$SKILL_SOURCE_DIR" "$SKILL_DEST_DIR"
 
 python3 - "$CONFIG_PATH" "$SHARED_SKILL_ROOT" <<'PY'
+import os
 import sys
 from pathlib import Path
 
@@ -43,7 +44,21 @@ if isinstance(external_dirs, str):
 elif not isinstance(external_dirs, list):
     external_dirs = []
 
-if shared_root not in external_dirs:
+config_root = config_path.parent
+
+def _canonical(path_value):
+    raw = os.path.expanduser(os.path.expandvars(str(path_value)))
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = config_root / candidate
+    try:
+        return str(candidate.resolve())
+    except OSError:
+        return str(candidate)
+
+shared_root_canonical = _canonical(shared_root)
+existing_canonical = {_canonical(entry) for entry in external_dirs}
+if shared_root_canonical not in existing_canonical:
     external_dirs.append(shared_root)
 
 skills["external_dirs"] = external_dirs
